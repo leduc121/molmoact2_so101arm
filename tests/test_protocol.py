@@ -16,3 +16,6 @@ class ProtocolTests(unittest.TestCase):
     def test_jpeg_roundtrip(self): self.assertEqual(decode_jpeg(encode_jpeg(Image.new("RGB", (3, 2)))).size, (3, 2))
     def test_response_rejects_nonfinite_actions(self):
         with self.assertRaises(ValueError): PolicyResponse("request-1", np.full((1, 6), np.inf), time.monotonic()).validate()
+    def test_response_roundtrips_inference_timing(self):
+        value = PolicyResponse("request-1", np.zeros((2, 6)), time.monotonic(), 12.5)
+        self.assertEqual(PolicyResponse.from_wire(value.to_wire()).server_inference_ms, 12.5)

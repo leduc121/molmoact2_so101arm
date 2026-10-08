@@ -31,6 +31,8 @@ class RemoteMockTests(unittest.TestCase):
     def test_cli_dry_run_default_and_remote_url_requirement(self):
         import inference
         argv = ["inference.py", "--prompt", "x", "--head-cam", "/dev/video4", "--side-cam", "/dev/video2"]
-        with patch.object(sys, "argv", argv): self.assertTrue(inference.args().dry_run)
+        with patch.object(sys, "argv", argv):
+            parsed = inference.args()
+            self.assertTrue(parsed.dry_run); self.assertTrue(parsed.cuda_graph); self.assertEqual(parsed.smooth_alpha, 1.0)
         with patch.object(sys, "argv", argv + ["--policy-backend", "remote"]), patch("sys.stderr", io.StringIO()):
             with self.assertRaises(SystemExit): inference.args()

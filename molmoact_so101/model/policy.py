@@ -9,6 +9,7 @@ lives in runtime.py alongside the safety clamps that need arm-frame numbers.
 """
 import os
 import shutil
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -145,7 +146,10 @@ class MolmoActPolicy:
             (T, JOINT_COUNT) float32 numpy array of joint targets in model frame.
             T is typically 30 (one second at 30 fps).
         """
-        with torch.inference_mode():
+        autocast = (torch.autocast("cuda", dtype=self.dtype)
+                    if str(self.device).startswith("cuda") and self.dtype in (torch.float16, torch.bfloat16)
+                    else nullcontext())
+        with torch.inference_mode(), autocast:
             out = self.model.predict_action(
                 processor=self.processor,
                 images=images,

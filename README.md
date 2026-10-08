@@ -33,6 +33,8 @@ python inference.py --live --follower-port /dev/ttyACM0 --head-cam /dev/v4l/by-i
 
 Preserved defaults apply the original v3→v2.1 joint conversion. `--max-action-step-deg`, `--max-observation-age-ms`, and `--action-watchdog-s` bound actions. Camera/inference failures clear action chunks; stale targets are not replayed.
 
+`--cuda-graph` is enabled by default. On a new GPU server, complete the warm-up below before timing or using live actions. Keep `--smooth-alpha=1.0` initially; only test `0.7` to `0.85` after the logged response age is consistently below the observation-age limit.
+
 ## Pre-GPU remote API test
 
 This verifies JPEG serialization, protocol schema, bearer-token authentication,
@@ -72,3 +74,24 @@ python inference.py --policy-backend remote --server-url https://gpu.example:800
 ```
 
 Wire requests contain two JPEG RGB images, model-frame state, UUID, protocol version and camera-slot metadata. Responses must match the UUID and are rejected if duplicate/out-of-order. Server timestamps establish only server-process ordering; observation freshness remains enforced locally.
+
+After exposing the server through a secure tunnel, warm it before benchmark/live use:
+
+```bash
+curl -sS -H "Authorization: Bearer $MOLMOACT_API_TOKEN" https://YOUR-TUNNEL/readyz
+curl -sS -X POST -H "Authorization: Bearer $MOLMOACT_API_TOKEN" https://YOUR-TUNNEL/v1/warmup
+```
+
+`/v1/warmup` runs blank-image inference only on the GPU; it cannot reach robot hardware. Producer logs show `age` (observation-to-response latency), `transport` and server `model` milliseconds. A chunk has a one-second 30 Hz horizon: if response age approaches one second, optimize GPU/tunnel latency instead of loosening safety limits.
+
+Benchmark with saved camera images before enabling motors:
+
+```bash
+python tools/benchmark_remote_policy.py \
+  --server-url https://YOUR-TUNNEL \
+  --head-image head.jpg --side-image side.jpg --requests 20
+```
+
+This sends no motor commands. Target p95 response age well below the one-second
+action horizon; if it exceeds `--max-observation-age-ms`, live runtime safely
+rejects that response instead of executing it late.

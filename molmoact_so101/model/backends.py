@@ -15,6 +15,7 @@ from .protocol import PolicyRequest, PolicyResponse, decode_jpeg, validate_actio
 
 
 class PolicyBackend(ABC):
+    last_diagnostics: dict[str, float | None] = {}
     @abstractmethod
     def predict(self, request: PolicyRequest) -> np.ndarray: ...
 
@@ -22,11 +23,14 @@ class PolicyBackend(ABC):
 class LocalPolicyBackend(PolicyBackend):
     def __init__(self, policy): self.policy = policy
     def predict(self, request: PolicyRequest) -> np.ndarray:
+        started = time.perf_counter()
         request.validate()
         images = [decode_jpeg(value) for value in request.images_jpeg]
-        return validate_actions(self.policy.predict_chunk(images=images, state=request.state,
+        actions = validate_actions(self.policy.predict_chunk(images=images, state=request.state,
                                 prompt=request.prompt, num_steps=request.num_steps,
                                 cuda_graph=request.cuda_graph))
+        self.last_diagnostics = {"transport_ms": 0.0, "policy_ms": (time.perf_counter() - started) * 1000.0}
+        return actions
 
 
 class RemotePolicyBackend(PolicyBackend):
@@ -36,8 +40,10 @@ class RemotePolicyBackend(PolicyBackend):
             raise ValueError("server URL must start with http:// or https://")
         self.url, self.token, self.timeout = server_url.rstrip("/") + "/v1/predict", token, timeout
         self._last_response_server_time = -float("inf")
+        self.last_diagnostics = {}
 
     def predict(self, request: PolicyRequest) -> np.ndarray:
+        started = time.perf_counter()
         request.validate()
         headers = {"Content-Type": "application/json"}
         if self.token: headers["Authorization"] = f"Bearer {self.token}"
@@ -55,6 +61,10 @@ class RemotePolicyBackend(PolicyBackend):
         if parsed.server_monotonic <= self._last_response_server_time:
             raise RuntimeError("duplicate or out-of-order remote response")
         self._last_response_server_time = parsed.server_monotonic
+        self.last_diagnostics = {
+            "transport_ms": (time.perf_counter() - started) * 1000.0,
+            "policy_ms": parsed.server_inference_ms,
+        }
         return validate_actions(parsed.actions)
 
 

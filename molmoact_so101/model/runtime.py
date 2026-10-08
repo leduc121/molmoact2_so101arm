@@ -17,7 +17,7 @@ def _pil(bgr): return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 class RuntimeConfig:
     prompt: str; exec_hz: float = 30.; max_step_deg: float = 15.; actions_per_chunk: Optional[int] = None
     smooth_alpha: float = 1.; ensemble_m: float = .5; warmup_predictions: int = 0; num_steps: int = 10
-    cuda_graph: bool = False; save_frames_dir: Optional[str] = None; dry_run: bool = True
+    cuda_graph: bool = True; save_frames_dir: Optional[str] = None; dry_run: bool = True
     max_observation_age_ms: float = 500.; watchdog_s: float = 1.; camera_slots: tuple[str,str] = ("head", "side")
 
 class ChunkRingBuffer:
@@ -55,8 +55,14 @@ class _Producer(threading.Thread):
                 if self.cfg.save_frames_dir:
                     stamp=str(int(time.time()*1000)); [cv2.imwrite(os.path.join(self.cfg.save_frames_dir,f"{stamp}_in{i}.jpg"), im) for i,im in enumerate(images)]
                 req=PolicyRequest(str(uuid.uuid4()), self.cfg.prompt, self.signs*arm+self.offsets, time.monotonic(), [encode_jpeg(_pil(im)) for im in images], self.cfg.camera_slots, self.cfg.num_steps, self.cfg.cuda_graph)
-                raw=validate_actions(self.backend.predict(req)); actions=np.clip((raw-self.offsets)*self.signs,self.joint_min,self.joint_max)
+                raw=validate_actions(self.backend.predict(req))
+                response_age_ms = (time.monotonic() - req.observation_monotonic) * 1000.0
+                if response_age_ms > self.cfg.max_observation_age_ms:
+                    raise RuntimeError(f"stale inference response ({response_age_ms:.0f}ms > {self.cfg.max_observation_age_ms:.0f}ms)")
+                actions=np.clip((raw-self.offsets)*self.signs,self.joint_min,self.joint_max)
                 count+=1; self.failed.clear()
+                diag = getattr(self.backend, "last_diagnostics", {})
+                print(f"[Producer] id={count} age={response_age_ms:.0f}ms transport={diag.get('transport_ms', 0):.0f}ms model={diag.get('policy_ms', 0) or 0:.0f}ms chunk={actions.shape[0]}")
                 if count>self.cfg.warmup_predictions: self.ring.add(actions, req.observation_monotonic)
             except Exception as exc:
                 self.ring.clear(); self.failed.set(); print(f"[Producer] {type(exc).__name__}: {exc}"); time.sleep(.1)

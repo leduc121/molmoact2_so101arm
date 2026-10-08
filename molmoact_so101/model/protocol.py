@@ -49,7 +49,7 @@ class PolicyRequest:
     images_jpeg: Sequence[str]
     slots: tuple[str, str] = ("head", "side")
     num_steps: int = 10
-    cuda_graph: bool = False
+    cuda_graph: bool = True
     protocol_version: str = PROTOCOL_VERSION
 
     def validate(self) -> None:
@@ -71,7 +71,7 @@ class PolicyRequest:
     def from_wire(cls, data: dict) -> "PolicyRequest":
         result = cls(data["request_id"], data["prompt"], np.asarray(data["state"], dtype=np.float32),
                      float(data["observation_monotonic"]), data["images_jpeg"], tuple(data.get("slots", [])),
-                     int(data.get("num_steps", 10)), bool(data.get("cuda_graph", False)),
+                     int(data.get("num_steps", 10)), bool(data.get("cuda_graph", True)),
                      data.get("protocol_version", ""))
         result.validate()
         return result
@@ -82,21 +82,26 @@ class PolicyResponse:
     request_id: str
     actions: np.ndarray
     server_monotonic: float
+    server_inference_ms: float | None = None
     protocol_version: str = PROTOCOL_VERSION
 
     def validate(self) -> None:
         if self.protocol_version != PROTOCOL_VERSION or not self.request_id or not np.isfinite(self.server_monotonic):
             raise ValueError("invalid response metadata")
+        if self.server_inference_ms is not None and (not np.isfinite(self.server_inference_ms) or self.server_inference_ms < 0):
+            raise ValueError("server_inference_ms must be finite and non-negative")
         validate_actions(self.actions)
 
     def to_wire(self) -> dict:
         self.validate()
         return {"protocol_version": self.protocol_version, "request_id": self.request_id,
-                "actions": self.actions.tolist(), "server_monotonic": self.server_monotonic}
+                "actions": self.actions.tolist(), "server_monotonic": self.server_monotonic,
+                "server_inference_ms": self.server_inference_ms}
 
     @classmethod
     def from_wire(cls, data: dict) -> "PolicyResponse":
         result = cls(data["request_id"], np.asarray(data["actions"], dtype=np.float32),
-                     float(data["server_monotonic"]), data.get("protocol_version", ""))
+                     float(data["server_monotonic"]), data.get("server_inference_ms"),
+                     data.get("protocol_version", ""))
         result.validate()
         return result
