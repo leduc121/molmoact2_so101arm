@@ -7,3 +7,5 @@ venv/
 outputs/
 saved_frames/
 *.mp4
+head.jpg
+side.jpg
