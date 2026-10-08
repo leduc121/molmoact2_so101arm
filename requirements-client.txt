@@ -1,0 +1,6 @@
+# Laptop client: USB cameras, protocol, and optional SO-101 driver. No model runtime.
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+lerobot==0.5.1
+feetech-servo-sdk

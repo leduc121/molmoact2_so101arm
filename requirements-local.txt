@@ -1,0 +1,5 @@
+# Local GPU laptop inference
+-r requirements-client.txt
+torch>=2.1.0
+transformers>=4.52.0
+huggingface-hub>=0.24.0

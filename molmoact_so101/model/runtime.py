@@ -1,332 +1,92 @@
-"""
-runtime.py — async producer/consumer with temporal ensembling for live
-MolmoAct2 inference on the SO-101.
-
-Two threads owned by AsyncPolicyRunner:
-
-    InferenceProducer ─writes─► ChunkRingBuffer ◄─reads─ ExecutionConsumer
-                                                               │
-                           arm_state ◄──get_state── follower   │
-                                                               ▼
-                                                          set_target
-
-Producer captures fresh observations and runs predict_chunk as fast as the
-GPU allows (~700 ms per chunk on a typical laptop GPU). Each emitted chunk
-lands in a ring buffer tagged with its observation wall-clock time (t_obs).
-
-Consumer ticks at exec_hz. On each tick it finds every chunk whose prediction
-window [t_obs, t_obs + len/ACTION_FPS] covers "now", takes the in-chunk step
-index step_i = (now - t_obs) * ACTION_FPS, and computes a weighted average of
-those per-chunk actions with weights exp(-ensemble_m * age_seconds). This is
-the ACT temporal-ensembling formulation (Zhao et al. 2023) adapted to async
-inference where chunks arrive every ~700 ms rather than every step.
-"""
-import collections
-import os
-import threading
-import time
+"""Fresh-observation async runner. It never holds or replays a stale action."""
+from __future__ import annotations
+import collections, os, threading, time, uuid
 from dataclasses import dataclass
 from typing import Optional
-
-import cv2
-import numpy as np
+import cv2, numpy as np
 from PIL import Image
-
-from .policy import ACTION_FPS, MolmoActPolicy
+from .protocol import PolicyRequest, encode_jpeg, validate_actions
 from ..setup.frame_transforms import JOINT_COUNT, clip_action
 
+# Training/action playback rate. Kept here so remote clients do not import model deps.
+ACTION_FPS = 30.0
 
-def _bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-
+def _pil(bgr): return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 @dataclass
 class RuntimeConfig:
-    """All knobs that affect producer/consumer behaviour."""
-    prompt: str
-    exec_hz: float = 30.0
-    max_step_deg: float = 15.0
-    actions_per_chunk: Optional[int] = None
-    smooth_alpha: float = 1.0
-    ensemble_m: float = 0.5
-    warmup_predictions: int = 0
-    num_steps: int = 10
-    cuda_graph: bool = False
-    scene_only: bool = False
-    save_frames_dir: Optional[str] = None
-    dry_run: bool = False
-
+    prompt: str; exec_hz: float = 30.; max_step_deg: float = 15.; actions_per_chunk: Optional[int] = None
+    smooth_alpha: float = 1.; ensemble_m: float = .5; warmup_predictions: int = 0; num_steps: int = 10
+    cuda_graph: bool = False; save_frames_dir: Optional[str] = None; dry_run: bool = True
+    max_observation_age_ms: float = 500.; watchdog_s: float = 1.; camera_slots: tuple[str,str] = ("head", "side")
 
 class ChunkRingBuffer:
-    """Thread-safe ring of the most recent chunks for temporal ensembling.
-
-    Each entry is (chunk, t_obs, chunk_id):
-      - chunk: (T, JOINT_COUNT) action plan in arm frame.
-      - t_obs: monotonic observation wall-clock time (right before predict_chunk).
-      - chunk_id: monotonically increasing diagnostic counter.
-    """
-
-    def __init__(self, capacity: int = 6):
-        self._lock    = threading.Lock()
-        self._entries = collections.deque(maxlen=capacity)
-        self._next_id = 1
-
-    def add(self, chunk: np.ndarray, t_obs: float) -> int:
-        with self._lock:
-            chunk_id = self._next_id
-            self._next_id += 1
-            self._entries.append((chunk, t_obs, chunk_id))
-            return chunk_id
-
+    def __init__(self, capacity=6): self.lock=threading.Lock(); self.entries=collections.deque(maxlen=capacity); self.next_id=1
+    def add(self, chunk, t_obs):
+        with self.lock:
+            ident=self.next_id; self.next_id+=1; self.entries.append((chunk,t_obs,ident)); return ident
     def snapshot(self):
-        with self._lock:
-            return list(self._entries)
-
+        with self.lock: return list(self.entries)
+    def clear(self):
+        with self.lock: self.entries.clear()
 
 class FrameBuffer:
-    """Thread-safe latest-frames cache for cv2.imshow on the main thread."""
-
-    def __init__(self):
-        self._lock  = threading.Lock()
-        self._wrist = None
-        self._scene = None
-
-    def set(self, wrist_bgr, scene_bgr):
-        with self._lock:
-            self._wrist = wrist_bgr
-            self._scene = scene_bgr
-
+    def __init__(self): self.lock=threading.Lock(); self.head=self.side=None
+    def set(self, head, side):
+        with self.lock: self.head,self.side=head,side
     def get(self):
-        with self._lock:
-            return self._wrist, self._scene
+        with self.lock: return self.head,self.side
 
-
-class _InferenceProducer(threading.Thread):
-    """Continuously runs predict_chunk and pushes each result to the ring."""
-
-    def __init__(self, *, policy: MolmoActPolicy, follower, wrist, scene,
-                 ring: ChunkRingBuffer, frame_buffer: FrameBuffer,
-                 signs: np.ndarray, offsets: np.ndarray,
-                 joint_min: np.ndarray, joint_max: np.ndarray,
-                 config: RuntimeConfig):
-        super().__init__(daemon=True, name="InferenceProducer")
-        self.policy       = policy
-        self.follower     = follower
-        self.wrist        = wrist
-        self.scene        = scene
-        self.ring         = ring
-        self.frame_buffer = frame_buffer
-        self.signs        = signs
-        self.offsets      = offsets
-        self.joint_min    = joint_min
-        self.joint_max    = joint_max
-        self.config       = config
-        self._stop_event  = threading.Event()
-
-    def stop(self):
-        self._stop_event.set()
-
-    def _capture(self):
-        wrist_bgr = self.wrist.read()
-        scene_bgr = self.scene.get_latest_color()
-        if wrist_bgr is None or scene_bgr is None:
-            return None, None, None
-        self.wrist.update_observations(wrist_bgr=wrist_bgr, scene_bgr=scene_bgr)
-        self.frame_buffer.set(wrist_bgr, scene_bgr)
-        arm_state = self.follower.get_state().astype(np.float32)
-        return wrist_bgr, scene_bgr, arm_state
-
-    def _save_inputs(self, frames_bgr):
-        if not self.config.save_frames_dir:
-            return
-        ts = int(time.time() * 1000)
-        for i, im in enumerate(frames_bgr):
-            cv2.imwrite(
-                os.path.join(self.config.save_frames_dir, f"{ts:013d}_in{i}.jpg"),
-                im,
-            )
-
-    def _postprocess(self, actions: np.ndarray) -> np.ndarray:
-        """Convert model-frame chunk to arm frame and apply hard joint limits."""
-        if actions.shape[1] != JOINT_COUNT:
-            raise RuntimeError(
-                f"Unexpected action shape {actions.shape}, expected (T, {JOINT_COUNT})"
-            )
-        actions = (actions - self.offsets) * self.signs  # model → arm frame
-        return np.clip(actions, self.joint_min, self.joint_max)
-
+class _Producer(threading.Thread):
+    def __init__(self, backend, follower, head, side, ring, frames, signs, offsets, joint_min, joint_max, cfg):
+        super().__init__(daemon=True, name="InferenceProducer"); self.backend=backend; self.follower=follower; self.head=head; self.side=side; self.ring=ring; self.frames=frames; self.signs=signs; self.offsets=offsets; self.joint_min=joint_min; self.joint_max=joint_max; self.cfg=cfg; self.stop_event=threading.Event(); self.failed=threading.Event()
+    def stop(self): self.stop_event.set()
     def run(self):
-        cfg      = self.config
-        pred_idx = 0
-        while not self._stop_event.is_set():
+        count=0
+        while not self.stop_event.is_set():
             try:
-                wrist_bgr, scene_bgr, arm_state = self._capture()
-                if wrist_bgr is None:
-                    time.sleep(0.05)
-                    continue
+                h,s=self.head.read(),self.side.read()
+                if h is None or s is None: self.ring.clear(); self.failed.set(); time.sleep(.1); continue
+                age=(time.monotonic()-min(h.captured_at,s.captured_at))*1000
+                if age > self.cfg.max_observation_age_ms: self.ring.clear(); self.failed.set(); continue
+                self.frames.set(h.bgr,s.bgr); arm=self.follower.get_state().astype(np.float32)
+                if arm.shape != (JOINT_COUNT,) or not np.isfinite(arm).all(): raise ValueError("invalid robot joint state")
+                ordered={"head":h.bgr,"side":s.bgr}; images=[ordered[x] for x in self.cfg.camera_slots]
+                if self.cfg.save_frames_dir:
+                    stamp=str(int(time.time()*1000)); [cv2.imwrite(os.path.join(self.cfg.save_frames_dir,f"{stamp}_in{i}.jpg"), im) for i,im in enumerate(images)]
+                req=PolicyRequest(str(uuid.uuid4()), self.cfg.prompt, self.signs*arm+self.offsets, time.monotonic(), [encode_jpeg(_pil(im)) for im in images], self.cfg.camera_slots, self.cfg.num_steps, self.cfg.cuda_graph)
+                raw=validate_actions(self.backend.predict(req)); actions=np.clip((raw-self.offsets)*self.signs,self.joint_min,self.joint_max)
+                count+=1; self.failed.clear()
+                if count>self.cfg.warmup_predictions: self.ring.add(actions, req.observation_monotonic)
+            except Exception as exc:
+                self.ring.clear(); self.failed.set(); print(f"[Producer] {type(exc).__name__}: {exc}"); time.sleep(.1)
 
-                model_inputs_bgr = (
-                    [scene_bgr, scene_bgr] if cfg.scene_only
-                    else [scene_bgr, wrist_bgr]
-                )
-                self._save_inputs(model_inputs_bgr)
-
-                state = self.signs * arm_state + self.offsets  # arm → model frame
-
-                t_obs = time.monotonic()
-                t0    = time.perf_counter()
-                raw_actions = self.policy.predict_chunk(
-                    images=[_bgr_to_pil(im) for im in model_inputs_bgr],
-                    state=state,
-                    prompt=cfg.prompt,
-                    num_steps=cfg.num_steps,
-                    cuda_graph=cfg.cuda_graph,
-                )
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-
-                actions = self._postprocess(raw_actions)
-
-                pred_idx += 1
-                if pred_idx <= cfg.warmup_predictions:
-                    print(f"[Producer] warm-up {pred_idx}/{cfg.warmup_predictions} "
-                          f"({dt_ms:.0f} ms) — not publishing")
-                    continue
-
-                chunk_id = self.ring.add(actions, t_obs)
-                a0_d = actions[0] - arm_state
-                print(
-                    f"[Producer] {dt_ms:.0f} ms  id={chunk_id}  "
-                    f"a0={np.round(actions[0], 1).tolist()}  "
-                    f"Δ={np.round(a0_d, 1).tolist()}"
-                )
-            except Exception as e:
-                print(f"[Producer] {type(e).__name__}: {e}")
-                time.sleep(0.1)
-
-
-class _ExecutionConsumer(threading.Thread):
-    """Ticks at exec_hz; ensembles active chunks and sends one target per tick."""
-
-    def __init__(self, *, follower, ring: ChunkRingBuffer, config: RuntimeConfig):
-        super().__init__(daemon=True, name="ExecutionConsumer")
-        self.follower         = follower
-        self.ring             = ring
-        self.exec_hz          = config.exec_hz
-        self.max_step_deg     = config.max_step_deg
-        self.actions_per_chunk = config.actions_per_chunk
-        self.smooth_alpha     = float(np.clip(config.smooth_alpha, 0.05, 1.0))
-        self.ensemble_m       = float(config.ensemble_m)
-        self._last_sent       = None
-        self._stop_event      = threading.Event()
-        print(f"[Consumer] temporal ensembling  weight=exp(-{self.ensemble_m:.2f}*age_s)  "
-              f"exec_hz={self.exec_hz:.0f}")
-        if self.smooth_alpha < 1.0:
-            print(f"[Consumer] post-ensemble EMA  alpha={self.smooth_alpha:.2f}")
-
-    def stop(self):
-        self._stop_event.set()
-
+class _Consumer(threading.Thread):
+    def __init__(self, follower, ring, producer, cfg):
+        super().__init__(daemon=True, name="ExecutionConsumer"); self.follower=follower; self.ring=ring; self.producer=producer; self.cfg=cfg; self.stop_event=threading.Event(); self.last=None
+    def stop(self): self.stop_event.set()
     def run(self):
-        interval = 1.0 / self.exec_hz
-        seen_ids = set()
-        holding  = False
-        while not self._stop_event.is_set():
-            now     = time.monotonic()
-            entries = self.ring.snapshot()
-
-            active_actions = []
-            active_ages    = []
-            for chunk, t_obs, chunk_id in entries:
-                n = chunk.shape[0]
-                if self.actions_per_chunk is not None:
-                    n = min(n, self.actions_per_chunk)
-                step = int((now - t_obs) * ACTION_FPS)
-                if 0 <= step < n:
-                    active_actions.append(chunk[step])
-                    active_ages.append(now - t_obs)
-                    if chunk_id not in seen_ids:
-                        seen_ids.add(chunk_id)
-                        print(f"[Consumer] chunk {chunk_id} active  "
-                              f"step={step}/{n}  age={( now - t_obs)*1000:.0f}ms")
-
-            if not active_actions:
-                if not holding:
-                    print("[Consumer] no active chunks — holding last action")
-                    holding = True
-                time.sleep(interval)
-                continue
-            holding = False
-
-            ages        = np.asarray(active_ages, dtype=np.float32)
-            weights     = np.exp(-self.ensemble_m * ages)
-            weights    /= weights.sum()
-            actions_arr = np.stack(active_actions, axis=0)
-            target      = (weights[:, None] * actions_arr).sum(axis=0).astype(np.float32)
-
-            cur    = self.follower.get_state().astype(np.float32)
-            target = clip_action(target, cur, self.max_step_deg)
-
-            if self._last_sent is not None and self.smooth_alpha < 1.0:
-                target = (self.smooth_alpha * target
-                          + (1.0 - self.smooth_alpha) * self._last_sent)
-
-            self._last_sent = target
-            self.follower.set_target(target)
+        interval=1/self.cfg.exec_hz
+        while not self.stop_event.is_set():
+            now=time.monotonic()
+            if self.producer.failed.is_set(): time.sleep(interval); continue
+            active=[]; ages=[]
+            for chunk,t_obs,_ in self.ring.snapshot():
+                n=min(len(chunk),self.cfg.actions_per_chunk or len(chunk)); step=int((now-t_obs)*ACTION_FPS)
+                if 0 <= step < n and now-t_obs <= self.cfg.watchdog_s: active.append(chunk[step]); ages.append(now-t_obs)
+            if active:
+                w=np.exp(-self.cfg.ensemble_m*np.asarray(ages)); target=(np.stack(active)*(w/w.sum())[:,None]).sum(0).astype(np.float32)
+                target=clip_action(target,self.follower.get_state().astype(np.float32),self.cfg.max_step_deg)
+                if self.last is not None: target=self.cfg.smooth_alpha*target+(1-self.cfg.smooth_alpha)*self.last
+                self.last=target; self.follower.set_target(target)
             time.sleep(interval)
 
-
 class AsyncPolicyRunner:
-    """Owns the inference producer and execution consumer threads.
-
-    Usage:
-        with AsyncPolicyRunner(policy=..., follower=..., wrist=..., scene=...,
-                               signs=..., offsets=...,
-                               joint_min=..., joint_max=...,
-                               config=...) as runner:
-            # main thread: show cameras or just wait for Ctrl+C
-    """
-
-    def __init__(self, *, policy: MolmoActPolicy, follower, wrist, scene,
-                 signs: np.ndarray, offsets: np.ndarray,
-                 joint_min: np.ndarray, joint_max: np.ndarray,
-                 config: RuntimeConfig):
-        self.ring         = ChunkRingBuffer()
-        self.frame_buffer = FrameBuffer()
-        self._producer = _InferenceProducer(
-            policy=policy, follower=follower, wrist=wrist, scene=scene,
-            ring=self.ring, frame_buffer=self.frame_buffer,
-            signs=signs, offsets=offsets,
-            joint_min=joint_min, joint_max=joint_max,
-            config=config,
-        )
-        self._consumer = (None if config.dry_run
-                          else _ExecutionConsumer(
-                              follower=follower,
-                              ring=self.ring,
-                              config=config,
-                          ))
-
-    def start(self) -> "AsyncPolicyRunner":
-        self._producer.start()
-        if self._consumer is not None:
-            self._consumer.start()
-        return self
-
-    def stop(self, join_timeout: float = 2.0) -> None:
-        if self._consumer is not None:
-            self._consumer.stop()
-        self._producer.stop()
-        if self._consumer is not None:
-            self._consumer.join(timeout=join_timeout)
-        self._producer.join(timeout=join_timeout)
-
-    def latest_frames(self):
-        """Returns (wrist_bgr, scene_bgr) from the last producer capture."""
-        return self.frame_buffer.get()
-
-    def __enter__(self):
-        return self.start()
-
-    def __exit__(self, exc_type, exc, tb):
-        self.stop()
-        return False
+    def __init__(self, *, backend, follower, head, side, signs, offsets, joint_min, joint_max, config):
+        self.ring=ChunkRingBuffer(); self.frames=FrameBuffer(); self.producer=_Producer(backend,follower,head,side,self.ring,self.frames,signs,offsets,joint_min,joint_max,config); self.consumer=None if config.dry_run else _Consumer(follower,self.ring,self.producer,config)
+    def start(self): self.producer.start(); self.consumer and self.consumer.start(); return self
+    def stop(self, join_timeout=2):
+        self.producer.stop(); self.consumer and self.consumer.stop(); self.ring.clear(); self.producer.join(join_timeout); self.consumer and self.consumer.join(join_timeout)
+    def latest_frames(self): return self.frames.get()
+    def __enter__(self): return self.start()
+    def __exit__(self,*_): self.stop(); return False

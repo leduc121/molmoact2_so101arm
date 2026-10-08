@@ -81,7 +81,7 @@ class WristCamera:
 class _AEController:
     """Adaptive brightness controller for cameras whose exposure_time_absolute
     is non-functional. Nudges the `brightness` v4l2 control on a slow loop to
-    track a target intensity, optionally matching the RealSense scene mean so
+    track a target intensity, optionally matching a second camera's scene mean so
     both cameras stay matched as room lighting changes.
     """
 
