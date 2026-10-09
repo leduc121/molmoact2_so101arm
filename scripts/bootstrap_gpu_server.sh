@@ -22,7 +22,17 @@ EOF
 fi
 
 if [[ ! -d .venv ]]; then
-  python3.12 -m venv .venv
+  if ! python3.12 -m venv .venv; then
+    rm -rf .venv
+    if command -v sudo >/dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y python3.12-venv
+      python3.12 -m venv .venv
+    else
+      echo "ERROR: install python3.12-venv, then rerun this script." >&2
+      exit 1
+    fi
+  fi
 fi
 source .venv/bin/activate
 python -m pip install --upgrade pip
