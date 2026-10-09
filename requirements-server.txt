@@ -1,3 +1,8 @@
--r requirements-local.txt
+# GPU inference server only. It does not need OpenCV, LeRobot, or servo drivers.
+torch>=2.1.0
+transformers>=4.52.0
+huggingface-hub>=0.24.0
+Pillow>=10.0.0
+numpy>=1.24.0
 fastapi>=0.110
 uvicorn[standard]>=0.27

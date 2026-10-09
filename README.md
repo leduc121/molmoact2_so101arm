@@ -54,14 +54,17 @@ it never loads MolmoAct2 and never controls hardware.
 
 ## Remote server
 
-On a GPU server, create a fresh Python 3.12 environment and install a
-CUDA-compatible PyTorch build before installing project dependencies, then:
+For the lowest-friction setup, choose **Ubuntu 24.04**, an RTX 3090/A10/L4-or-newer
+GPU with at least 24 GB VRAM, SSH access, and at least 50 GB free disk. The
+bootstrap script creates a local Python 3.12 environment, installs the CUDA 12.1
+PyTorch wheel, then installs server-only dependencies (no LeRobot or motor driver).
 
 ```bash
-pip install -r requirements-server.txt
-cp .env.example .env # set a real secret; do not commit it
-set -a; source .env; set +a
-uvicorn server:app --host 127.0.0.1 --port 8000
+git clone https://github.com/leduc121/molmoact2_so101arm.git
+cd molmoact2_so101arm
+bash scripts/bootstrap_gpu_server.sh
+nano .env # set a real, private MOLMOACT_API_TOKEN
+bash scripts/run_gpu_server.sh
 ```
 
 Use VPN/SSH tunnel or TLS proxy and a strong `MOLMOACT_API_TOKEN`; never expose it publicly. GPU/model support (including RTX 3090/5090) requires runtime verification. Remote client mode does not load model weights on laptop:
